@@ -205,7 +205,7 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 }
 
 func (c *LiTimeBluetoothClient) QueryData() error {
-	_, err := c.writeCharacteristic.Write(MagicQuery)
+	_, err := c.writeCharacteristic.WriteWithoutResponse(MagicQuery)
 	if err != nil {
 		return fmt.Errorf("failed to write query data: %w", err)
 	}
