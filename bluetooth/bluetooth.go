@@ -114,7 +114,7 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 			c.logger.Debug("found device", slog.String("name", device.LocalName()), slog.String("address", device.Address.String()))
 			if device.LocalName() == c.DeviceName {
 				deviceAddress = device.Address
-				adapter.StopScan()
+				_ = adapter.StopScan()
 				deviceFound <- true
 			}
 		})
@@ -125,13 +125,13 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 
 	select {
 	case <-deviceFound:
-		c.bluetoothAdapter.StopScan()
+		_ = c.bluetoothAdapter.StopScan()
 	case err := <-scanErr:
-		c.bluetoothAdapter.StopScan()
+		_ = c.bluetoothAdapter.StopScan()
 		wg.Wait()
 		return fmt.Errorf("failed to scan for devices: %w", err)
 	case <-scanCtx.Done():
-		c.bluetoothAdapter.StopScan()
+		_ = c.bluetoothAdapter.StopScan()
 		wg.Wait()
 		if scanCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("scan timeout: device '%s' not found within %v", c.DeviceName, c.scanTimeout)
