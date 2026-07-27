@@ -21,6 +21,10 @@ const (
 
 var (
 	MagicQuery = []byte{0x00, 0x00, 0x04, 0x01, 0x13, 0x55, 0xAA, 0x17}
+
+	// ErrNotConnected is returned by QueryData when there is no live connection
+	// to write to, which includes the window after an explicit Disconnect.
+	ErrNotConnected = fmt.Errorf("not connected")
 )
 
 type LiTimeBluetoothClient struct {
@@ -32,6 +36,13 @@ type LiTimeBluetoothClient struct {
 	enableNotificationsCallback func(b []byte)
 	scanTimeout                 time.Duration
 
+	// mu guards the connection state below, which Connect and Disconnect
+	// replace wholesale and QueryData reads.
+	mu sync.Mutex
+	// address, when set, is connected to directly and no scan is performed.
+	address             *bluetooth.Address
+	connected           bool
+	device              bluetooth.Device
 	writeCharacteristic bluetooth.DeviceCharacteristic
 }
 
@@ -92,71 +103,157 @@ func WithScanTimeout(timeout time.Duration) LiTimeBluetoothClientOption {
 	}
 }
 
+// WithAdapter selects the adapter this client uses, for hosts with more than one
+// radio. Defaults to bluetooth.DefaultAdapter.
+func WithAdapter(adapter *bluetooth.Adapter) LiTimeBluetoothClientOption {
+	return func(client *LiTimeBluetoothClient) {
+		client.bluetoothAdapter = adapter
+	}
+}
+
+// WithAddress connects straight to a known device address, skipping the scan
+// entirely.
+//
+// This is the option to use when talking to several batteries. Matching on the
+// advertised name is only reliable when every battery advertises a distinct one,
+// and even then the address route is faster, because it does not pay a scan
+// timeout per battery. Use ScanForDevices or ParseAddress to obtain an address.
+func WithAddress(address bluetooth.Address) LiTimeBluetoothClientOption {
+	return func(client *LiTimeBluetoothClient) {
+		client.address = &address
+	}
+}
+
+// Address reports the address this client is connected to, or is configured to
+// connect to. The second return value is false when the client was created with
+// only a name and has not yet resolved it by scanning.
+func (c *LiTimeBluetoothClient) Address() (bluetooth.Address, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.address == nil {
+		return bluetooth.Address{}, false
+	}
+
+	return *c.address, true
+}
+
+// Connected reports whether the client currently believes it holds a connection.
+//
+// This tracks Connect and Disconnect calls made through this client. It does not
+// detect a peer that has gone away on its own: as a central, the underlying
+// stack provides no such notification, so a battery that drops out of range or
+// powers off still reads as connected here. Treat a lack of incoming
+// notifications as the authoritative liveness signal and reconnect on that.
+func (c *LiTimeBluetoothClient) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.connected
+}
+
+// Connect resolves the device if necessary, connects to it, and enables
+// notifications.
+//
+// It may be called again after Disconnect to re-establish the connection. A
+// resolved address is remembered, so reconnecting does not rescan.
 func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	alreadyConnected := c.connected
+	address := c.address
+	c.mu.Unlock()
+
+	if alreadyConnected {
+		return nil
+	}
+
 	c.logger.Debug("enabling bluetooth adapter")
-	err := c.bluetoothAdapter.Enable()
-	if err != nil {
-		return fmt.Errorf("failed to enable bluetooth adapter: %w", err)
+	if err := enableAdapter(c.bluetoothAdapter); err != nil {
+		return err
 	}
 
-	scanCtx, cancel := context.WithTimeout(ctx, c.scanTimeout)
-	defer cancel()
-
-	var deviceAddress bluetooth.Address
-	deviceFound := make(chan bool, 1)
-	scanErr := make(chan error, 1)
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := c.bluetoothAdapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
-			c.logger.Debug("found device", slog.String("name", device.LocalName()), slog.String("address", device.Address.String()))
-			if device.LocalName() == c.DeviceName {
-				deviceAddress = device.Address
-				_ = adapter.StopScan()
-				deviceFound <- true
-			}
-		})
+	if address == nil {
+		resolved, err := c.resolveByName(ctx)
 		if err != nil {
-			scanErr <- err
+			return err
 		}
-	}()
-
-	select {
-	case <-deviceFound:
-		_ = c.bluetoothAdapter.StopScan()
-	case err := <-scanErr:
-		_ = c.bluetoothAdapter.StopScan()
-		wg.Wait()
-		return fmt.Errorf("failed to scan for devices: %w", err)
-	case <-scanCtx.Done():
-		_ = c.bluetoothAdapter.StopScan()
-		wg.Wait()
-		if scanCtx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("scan timeout: device '%s' not found within %v", c.DeviceName, c.scanTimeout)
-		}
-		return fmt.Errorf("scan cancelled: %w", scanCtx.Err())
+		address = resolved
 	}
 
-	wg.Wait()
-
-	if deviceAddress.String() == "" {
-		return fmt.Errorf("device '%s' not found during scan", c.DeviceName)
-	}
-
-	c.logger.Debug("found correct device", slog.String("device_name", c.DeviceName), slog.String("address", deviceAddress.String()))
-
-	c.logger.Debug("connecting to device", slog.String("address", deviceAddress.String()))
-	device, err := c.bluetoothAdapter.Connect(deviceAddress, bluetooth.ConnectionParams{})
+	c.logger.Debug("connecting to device", slog.String("address", address.String()))
+	device, err := c.bluetoothAdapter.Connect(*address, bluetooth.ConnectionParams{})
 	if err != nil {
 		return fmt.Errorf("failed to connect to device: %w", err)
 	}
 
-	c.logger.Debug("discovering services for device", slog.String("address", deviceAddress.String()))
+	writeCharacteristic, notifyCharacteristic, err := c.discoverCharacteristics(device)
+	if err != nil {
+		_ = device.Disconnect()
+		return err
+	}
+
+	if err := notifyCharacteristic.EnableNotifications(c.enableNotificationsCallback); err != nil {
+		_ = device.Disconnect()
+		return fmt.Errorf("failed to enable notifications: %w", err)
+	}
+
+	c.mu.Lock()
+	c.address = address
+	c.device = device
+	c.writeCharacteristic = writeCharacteristic
+	c.connected = true
+	c.mu.Unlock()
+
+	return nil
+}
+
+// resolveByName scans for a device advertising the client's configured name.
+func (c *LiTimeBluetoothClient) resolveByName(ctx context.Context) (*bluetooth.Address, error) {
+	if c.DeviceName == "" {
+		return nil, fmt.Errorf("no device name or address configured")
+	}
+
+	devices, err := ScanForDevices(ctx,
+		ScanWithAdapter(c.bluetoothAdapter),
+		ScanWithLogger(c.logger),
+		ScanWithTimeout(c.scanTimeout),
+		ScanWithNames(c.DeviceName),
+		ScanWithTargetCount(1),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(devices) == 0 {
+		return nil, fmt.Errorf("device '%s' not found within %v", c.DeviceName, c.scanTimeout)
+	}
+
+	if len(devices) > 1 {
+		// Several batteries of the same model can share a local name, in which
+		// case the winner here is whichever the adapter surfaced first and is
+		// not stable across runs. Configure addresses to disambiguate.
+		c.logger.Warn("multiple devices advertise this name, picking the first",
+			slog.String("device_name", c.DeviceName),
+			slog.Int("count", len(devices)))
+	}
+
+	address := devices[0].Address
+	c.logger.Debug("resolved device by name",
+		slog.String("device_name", c.DeviceName),
+		slog.String("address", address.String()))
+
+	return &address, nil
+}
+
+// discoverCharacteristics walks the device's services and returns the write and
+// notify characteristics the LiTime protocol needs.
+func (c *LiTimeBluetoothClient) discoverCharacteristics(device bluetooth.Device) (bluetooth.DeviceCharacteristic, bluetooth.DeviceCharacteristic, error) {
+	var empty bluetooth.DeviceCharacteristic
+
+	c.logger.Debug("discovering services for device")
 	services, err := device.DiscoverServices(nil)
 	if err != nil {
-		return fmt.Errorf("failed to discover services: %w", err)
+		return empty, empty, fmt.Errorf("failed to discover services: %w", err)
 	}
 	c.logger.Debug("discovered services", slog.Int("count", len(services)))
 
@@ -175,7 +272,7 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 		}
 	}
 	if characteristicErr != nil {
-		return fmt.Errorf("failed to discover characteristics: %w", characteristicErr)
+		return empty, empty, fmt.Errorf("failed to discover characteristics: %w", characteristicErr)
 	}
 	c.logger.Debug("discovered characteristics", slog.Int("count", len(characteristicMap)))
 
@@ -191,21 +288,46 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 	}
 
 	if characteristicExistsErr != nil {
-		return fmt.Errorf("failed to find characteristics in map: %w", characteristicExistsErr)
+		return empty, empty, fmt.Errorf("failed to find characteristics in map: %w", characteristicExistsErr)
 	}
 
-	c.writeCharacteristic = writeCharacteristic
+	return writeCharacteristic, notifyCharacteristic, nil
+}
 
-	err = notifyCharacteristic.EnableNotifications(c.enableNotificationsCallback)
-	if err != nil {
-		return fmt.Errorf("failed to enable notifications: %w", err)
+// Disconnect drops the connection. The client can be reconnected afterwards with
+// Connect. Disconnecting an already-disconnected client is not an error.
+func (c *LiTimeBluetoothClient) Disconnect() error {
+	c.mu.Lock()
+	if !c.connected {
+		c.mu.Unlock()
+		return nil
+	}
+	device := c.device
+	c.connected = false
+	c.device = bluetooth.Device{}
+	c.writeCharacteristic = bluetooth.DeviceCharacteristic{}
+	c.mu.Unlock()
+
+	if err := device.Disconnect(); err != nil {
+		return fmt.Errorf("failed to disconnect from device: %w", err)
 	}
 
 	return nil
 }
 
+// QueryData asks the battery to report its current state. The reply arrives
+// asynchronously on the notification callback rather than as a return value.
 func (c *LiTimeBluetoothClient) QueryData() error {
-	_, err := c.writeCharacteristic.WriteWithoutResponse(MagicQuery)
+	c.mu.Lock()
+	connected := c.connected
+	writeCharacteristic := c.writeCharacteristic
+	c.mu.Unlock()
+
+	if !connected {
+		return ErrNotConnected
+	}
+
+	_, err := writeCharacteristic.WriteWithoutResponse(MagicQuery)
 	if err != nil {
 		return fmt.Errorf("failed to write query data: %w", err)
 	}
