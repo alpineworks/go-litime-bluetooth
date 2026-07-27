@@ -111,13 +111,14 @@ func WithAdapter(adapter *bluetooth.Adapter) LiTimeBluetoothClientOption {
 	}
 }
 
-// WithAddress connects straight to a known device address, skipping the scan
-// entirely.
+// WithAddress identifies the device by address rather than advertised name.
 //
-// This is the option to use when talking to several batteries. Matching on the
-// advertised name is only reliable when every battery advertises a distinct one,
-// and even then the address route is faster, because it does not pay a scan
-// timeout per battery. Use ScanForDevices or ParseAddress to obtain an address.
+// This is the option to use when talking to several batteries, because matching
+// on the advertised name is only reliable when every battery advertises a
+// distinct one. Use ScanForDevices or ParseAddress to obtain an address.
+//
+// Note that this narrows the scan rather than skipping it: BlueZ needs to have
+// seen the device recently to connect to it, no matter how it was identified.
 func WithAddress(address bluetooth.Address) LiTimeBluetoothClientOption {
 	return func(client *LiTimeBluetoothClient) {
 		client.address = &address
@@ -152,11 +153,16 @@ func (c *LiTimeBluetoothClient) Connected() bool {
 	return c.connected
 }
 
-// Connect resolves the device if necessary, connects to it, and enables
-// notifications.
+// Connect locates the device, connects to it, and enables notifications.
 //
-// It may be called again after Disconnect to re-establish the connection. A
-// resolved address is remembered, so reconnecting does not rescan.
+// It may be called again after Disconnect to re-establish the connection.
+//
+// Every attempt scans first, including reconnects and connects to a known
+// address. This is not an optimisation that was missed: BlueZ can only connect
+// to a device it currently holds an object for, and it discards those objects
+// over time, so a connect that skips the scan fails once the device has aged
+// out. Knowing the address avoids having to search by name; it does not avoid
+// the scan.
 func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	alreadyConnected := c.connected
@@ -172,13 +178,15 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 		return err
 	}
 
-	if address == nil {
-		resolved, err := c.resolveByName(ctx)
-		if err != nil {
-			return err
-		}
-		address = resolved
+	address, err := c.locate(ctx, address)
+	if err != nil {
+		return err
 	}
+
+	// One connection may be established at a time per adapter.
+	state := stateFor(c.bluetoothAdapter)
+	state.connectMu.Lock()
+	defer state.connectMu.Unlock()
 
 	c.logger.Debug("connecting to device", slog.String("address", address.String()))
 	device, err := c.bluetoothAdapter.Connect(*address, bluetooth.ConnectionParams{})
@@ -207,25 +215,42 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// resolveByName scans for a device advertising the client's configured name.
-func (c *LiTimeBluetoothClient) resolveByName(ctx context.Context) (*bluetooth.Address, error) {
-	if c.DeviceName == "" {
-		return nil, fmt.Errorf("no device name or address configured")
-	}
-
-	devices, err := ScanForDevices(ctx,
+// locate scans for the device and returns the address to connect to.
+//
+// A configured address narrows the scan to that one device and is returned as
+// given; otherwise the client's name is used to discover it. Either way a scan
+// runs, which is what leaves the device connectable.
+func (c *LiTimeBluetoothClient) locate(ctx context.Context, address *bluetooth.Address) (*bluetooth.Address, error) {
+	opts := []ScanOption{
 		ScanWithAdapter(c.bluetoothAdapter),
 		ScanWithLogger(c.logger),
 		ScanWithTimeout(c.scanTimeout),
-		ScanWithNames(c.DeviceName),
 		ScanWithTargetCount(1),
-	)
+	}
+
+	switch {
+	case address != nil:
+		opts = append(opts, ScanWithAddresses(*address))
+	case c.DeviceName != "":
+		opts = append(opts, ScanWithNames(c.DeviceName))
+	default:
+		return nil, fmt.Errorf("no device name or address configured")
+	}
+
+	devices, err := ScanForDevices(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(devices) == 0 {
+		if address != nil {
+			return nil, fmt.Errorf("device %s not seen within %v", address.String(), c.scanTimeout)
+		}
 		return nil, fmt.Errorf("device '%s' not found within %v", c.DeviceName, c.scanTimeout)
+	}
+
+	if address != nil {
+		return address, nil
 	}
 
 	if len(devices) > 1 {
@@ -237,12 +262,12 @@ func (c *LiTimeBluetoothClient) resolveByName(ctx context.Context) (*bluetooth.A
 			slog.Int("count", len(devices)))
 	}
 
-	address := devices[0].Address
+	resolved := devices[0].Address
 	c.logger.Debug("resolved device by name",
 		slog.String("device_name", c.DeviceName),
-		slog.String("address", address.String()))
+		slog.String("address", resolved.String()))
 
-	return &address, nil
+	return &resolved, nil
 }
 
 // discoverCharacteristics walks the device's services and returns the write and
