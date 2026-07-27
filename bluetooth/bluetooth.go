@@ -178,15 +178,18 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 		return err
 	}
 
-	address, err := c.locate(ctx, address)
+	// The radio is held for the whole of bring-up: the scan, the connection it
+	// feeds, and the service discovery that follows. These conflict with each
+	// other across clients, not merely with themselves, so releasing between
+	// them lets one battery's scan abort another's connection.
+	state := stateFor(c.bluetoothAdapter)
+	state.radioMu.Lock()
+	defer state.radioMu.Unlock()
+
+	address, err := c.locateLocked(ctx, address)
 	if err != nil {
 		return err
 	}
-
-	// One connection may be established at a time per adapter.
-	state := stateFor(c.bluetoothAdapter)
-	state.connectMu.Lock()
-	defer state.connectMu.Unlock()
 
 	c.logger.Debug("connecting to device", slog.String("address", address.String()))
 	device, err := c.bluetoothAdapter.Connect(*address, bluetooth.ConnectionParams{})
@@ -215,12 +218,13 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// locate scans for the device and returns the address to connect to.
+// locateLocked scans for the device and returns the address to connect to. The
+// caller must already hold the adapter's radioMu.
 //
 // A configured address narrows the scan to that one device and is returned as
 // given; otherwise the client's name is used to discover it. Either way a scan
 // runs, which is what leaves the device connectable.
-func (c *LiTimeBluetoothClient) locate(ctx context.Context, address *bluetooth.Address) (*bluetooth.Address, error) {
+func (c *LiTimeBluetoothClient) locateLocked(ctx context.Context, address *bluetooth.Address) (*bluetooth.Address, error) {
 	opts := []ScanOption{
 		ScanWithAdapter(c.bluetoothAdapter),
 		ScanWithLogger(c.logger),
@@ -237,7 +241,7 @@ func (c *LiTimeBluetoothClient) locate(ctx context.Context, address *bluetooth.A
 		return nil, fmt.Errorf("no device name or address configured")
 	}
 
-	devices, err := ScanForDevices(ctx, opts...)
+	devices, err := scanLocked(ctx, newScanConfig(opts...))
 	if err != nil {
 		return nil, err
 	}

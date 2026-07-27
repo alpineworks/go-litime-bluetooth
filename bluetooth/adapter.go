@@ -26,15 +26,22 @@ type adapterState struct {
 	enableMu sync.Mutex
 	enabled  bool
 
-	// scanMu serialises whole Scan/StopScan cycles on this adapter.
-	scanMu sync.Mutex
-
-	// connectMu serialises connection establishment. A controller can only
-	// bring up one LE connection at a time; overlapping attempts abort each
-	// other with "le-connection-abort-by-local", which looks like both peers
-	// refusing rather than the two callers colliding. Only establishment is
-	// serialised, not the resulting connections, which operate independently.
-	connectMu sync.Mutex
+	// radioMu serialises everything that needs exclusive use of the radio:
+	// scanning, connection establishment, and the service discovery that
+	// follows it.
+	//
+	// One lock covers all three because they conflict with each other, not just
+	// with themselves. A controller brings up one LE connection at a time, and
+	// starting discovery aborts a connection attempt already in flight. Holding
+	// separate scan and connect locks is not enough: one client would begin
+	// scanning while another was still connecting, and BlueZ would abort the
+	// connection with "le-connection-abort-by-local". That failure surfaces on
+	// whichever battery was already working rather than on the one being added,
+	// which makes it read as unrelated hardware trouble.
+	//
+	// Only bring-up is serialised. Established connections carry on in parallel,
+	// which is the part that actually needs to overlap.
+	radioMu sync.Mutex
 }
 
 var (

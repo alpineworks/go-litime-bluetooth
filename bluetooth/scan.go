@@ -113,6 +113,20 @@ func ScanWithTargetCount(count int) ScanOption {
 // Results are deduplicated by address. A device seen without a name that is
 // later re-advertised with one is reported with the name.
 func ScanForDevices(ctx context.Context, opts ...ScanOption) ([]DiscoveredDevice, error) {
+	cfg := newScanConfig(opts...)
+
+	if err := enableAdapter(cfg.adapter); err != nil {
+		return nil, err
+	}
+
+	state := stateFor(cfg.adapter)
+	state.radioMu.Lock()
+	defer state.radioMu.Unlock()
+
+	return scanLocked(ctx, cfg)
+}
+
+func newScanConfig(opts ...ScanOption) *scanConfig {
 	cfg := &scanConfig{
 		adapter: bluetooth.DefaultAdapter,
 		timeout: DefaultScanTimeout,
@@ -122,14 +136,16 @@ func ScanForDevices(ctx context.Context, opts ...ScanOption) ([]DiscoveredDevice
 		opt(cfg)
 	}
 
-	if err := enableAdapter(cfg.adapter); err != nil {
-		return nil, err
-	}
+	return cfg
+}
 
-	state := stateFor(cfg.adapter)
-	state.scanMu.Lock()
-	defer state.scanMu.Unlock()
-
+// scanLocked performs the scan. The caller must already hold the adapter's
+// radioMu and must have enabled the adapter.
+//
+// Connect uses this rather than ScanForDevices so that it can hold the radio
+// across both the scan and the connection that follows, which is the whole
+// point of the lock: a scan starting between the two would abort the connect.
+func scanLocked(ctx context.Context, cfg *scanConfig) ([]DiscoveredDevice, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
 
