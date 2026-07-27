@@ -28,6 +28,13 @@ type adapterState struct {
 
 	// scanMu serialises whole Scan/StopScan cycles on this adapter.
 	scanMu sync.Mutex
+
+	// connectMu serialises connection establishment. A controller can only
+	// bring up one LE connection at a time; overlapping attempts abort each
+	// other with "le-connection-abort-by-local", which looks like both peers
+	// refusing rather than the two callers colliding. Only establishment is
+	// serialised, not the resulting connections, which operate independently.
+	connectMu sync.Mutex
 }
 
 var (

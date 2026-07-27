@@ -32,6 +32,7 @@ type scanConfig struct {
 	adapter     *bluetooth.Adapter
 	logger      *slog.Logger
 	names       map[string]struct{}
+	addresses   map[string]struct{}
 	targetCount int
 	timeout     time.Duration
 }
@@ -71,6 +72,22 @@ func ScanWithNames(names ...string) ScanOption {
 		cfg.names = make(map[string]struct{}, len(names))
 		for _, name := range names {
 			cfg.names[name] = struct{}{}
+		}
+	}
+}
+
+// ScanWithAddresses restricts results to peripherals with one of the given
+// device addresses.
+//
+// Scanning for an address you already know is not redundant. BlueZ can only
+// connect to a device it currently has an object for, and it discards those
+// objects over time, so a scan is what makes a known address connectable again.
+// Address matching is case-insensitive.
+func ScanWithAddresses(addresses ...bluetooth.Address) ScanOption {
+	return func(cfg *scanConfig) {
+		cfg.addresses = make(map[string]struct{}, len(addresses))
+		for _, address := range addresses {
+			cfg.addresses[strings.ToUpper(address.String())] = struct{}{}
 		}
 	}
 }
@@ -137,11 +154,11 @@ func ScanForDevices(ctx context.Context, opts ...ScanOption) ([]DiscoveredDevice
 	go func() {
 		scanDone <- cfg.adapter.Scan(func(_ *bluetooth.Adapter, result bluetooth.ScanResult) {
 			name := result.LocalName()
-			if !cfg.matches(name) {
+			key := result.Address.String()
+
+			if !cfg.matches(name, key) {
 				return
 			}
-
-			key := result.Address.String()
 
 			mu.Lock()
 			existing, seen := found[key]
@@ -214,12 +231,19 @@ func ScanForDevices(ctx context.Context, opts ...ScanOption) ([]DiscoveredDevice
 	return devices, nil
 }
 
-func (cfg *scanConfig) matches(name string) bool {
-	if len(cfg.names) == 0 {
+// matches reports whether a scan result passes the configured filters. Name and
+// address filters are alternatives rather than conditions to satisfy together,
+// so a caller can resolve a mixed set of batteries in one scan.
+func (cfg *scanConfig) matches(name, address string) bool {
+	if len(cfg.names) == 0 && len(cfg.addresses) == 0 {
 		return true
 	}
 
-	_, ok := cfg.names[name]
+	if _, ok := cfg.names[name]; ok {
+		return true
+	}
+
+	_, ok := cfg.addresses[strings.ToUpper(address)]
 
 	return ok
 }

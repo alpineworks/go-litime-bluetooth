@@ -30,7 +30,7 @@ func TestScanConfigMatches(t *testing.T) {
 				ScanWithNames(tt.filters...)(cfg)
 			}
 
-			if got := cfg.matches(tt.input); got != tt.want {
+			if got := cfg.matches(tt.input, "11:22:33:AA:BB:CC"); got != tt.want {
 				t.Errorf("matches(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
@@ -46,7 +46,7 @@ func TestScanWithNamesEmpty(t *testing.T) {
 	cfg := &scanConfig{}
 	ScanWithNames()(cfg)
 
-	if !cfg.matches("anything") {
+	if !cfg.matches("anything", "11:22:33:AA:BB:CC") {
 		t.Error("ScanWithNames() with no names should leave the scan unfiltered")
 	}
 }
