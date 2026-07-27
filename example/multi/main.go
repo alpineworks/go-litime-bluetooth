@@ -149,17 +149,16 @@ func resolveAddresses(ctx context.Context, args []string) ([]tinygobluetooth.Add
 		return nil, err
 	}
 
-	addresses := make([]tinygobluetooth.Address, 0, len(devices))
 	for _, device := range devices {
 		slog.Info("found device",
 			slog.String("name", device.Name),
 			slog.String("address", device.Address.String()),
 			slog.Int("rssi", int(device.RSSI)))
-		addresses = append(addresses, device.Address)
 	}
 
 	// A bare scan reports every BLE peripheral around, not just batteries, so
-	// leave it to the operator to pick the right ones.
+	// nothing is connected to on this pass: the operator picks the right ones
+	// and passes them back in.
 	slog.Info("re-run with the addresses of the batteries you want to poll",
 		slog.Int("devices_found", len(devices)))
 
