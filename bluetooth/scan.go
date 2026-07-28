@@ -26,6 +26,18 @@ type DiscoveredDevice struct {
 
 	// RSSI is the signal strength in dBm at the time the device was seen.
 	RSSI int16
+
+	// ManufacturerData holds the advertisement's manufacturer data, keyed by
+	// Bluetooth SIG company identifier.
+	//
+	// Some devices publish their whole state here rather than exposing it over
+	// a connection, so a scan is all that is needed to read them. Reporting it
+	// lets a caller collect from those devices on the same adapter, and under
+	// the same serialisation, as devices it connects to.
+	//
+	// When a device is seen more than once during a scan, the most recent
+	// advertisement wins, because this is live state rather than identity.
+	ManufacturerData map[uint16][]byte
 }
 
 type scanConfig struct {
@@ -183,9 +195,10 @@ func scanLocked(ctx context.Context, cfg *scanConfig) ([]DiscoveredDevice, error
 				name = existing.Name
 			}
 			found[key] = DiscoveredDevice{
-				Name:    name,
-				Address: result.Address,
-				RSSI:    result.RSSI,
+				Name:             name,
+				Address:          result.Address,
+				RSSI:             result.RSSI,
+				ManufacturerData: manufacturerData(result.ManufacturerData()),
 			}
 			reached := cfg.targetCount > 0 && len(found) >= cfg.targetCount
 			mu.Unlock()
@@ -250,6 +263,24 @@ func scanLocked(ctx context.Context, cfg *scanConfig) ([]DiscoveredDevice, error
 // matches reports whether a scan result passes the configured filters. Name and
 // address filters are alternatives rather than conditions to satisfy together,
 // so a caller can resolve a mixed set of batteries in one scan.
+// manufacturerData collects an advertisement's manufacturer data by company id.
+//
+// The bytes are copied because the underlying stack reuses its advertisement
+// buffers between callbacks, so retaining the slice would hand the caller data
+// that changes underneath it.
+func manufacturerData(elements []bluetooth.ManufacturerDataElement) map[uint16][]byte {
+	if len(elements) == 0 {
+		return nil
+	}
+
+	data := make(map[uint16][]byte, len(elements))
+	for _, element := range elements {
+		data[element.CompanyID] = append([]byte(nil), element.Data...)
+	}
+
+	return data
+}
+
 func (cfg *scanConfig) matches(name, address string) bool {
 	if len(cfg.names) == 0 && len(cfg.addresses) == 0 {
 		return true
