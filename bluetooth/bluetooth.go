@@ -42,8 +42,23 @@ type LiTimeBluetoothClient struct {
 	// address, when set, is connected to directly and no scan is performed.
 	address             *bluetooth.Address
 	connected           bool
-	device              bluetooth.Device
+	device              disconnecter
 	writeCharacteristic bluetooth.DeviceCharacteristic
+	// notifyCharacteristic is the characteristic notifications were enabled on,
+	// kept so Disconnect can turn them off again. See Disconnect for why that
+	// matters.
+	notifyCharacteristic notificationToggler
+}
+
+// disconnecter is the part of bluetooth.Device that Disconnect needs.
+type disconnecter interface {
+	Disconnect() error
+}
+
+// notificationToggler is the part of bluetooth.DeviceCharacteristic that turns
+// notifications on (a callback) and off (nil).
+type notificationToggler interface {
+	EnableNotifications(callback func(buf []byte)) error
 }
 
 type LiTimeBluetoothClientOption func(*LiTimeBluetoothClient)
@@ -204,6 +219,9 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 	}
 
 	if err := notifyCharacteristic.EnableNotifications(c.enableNotificationsCallback); err != nil {
+		// On Linux the signal subscription is registered before StartNotify is
+		// attempted, so a failure here can still leave it behind.
+		_ = notifyCharacteristic.EnableNotifications(nil)
 		_ = device.Disconnect()
 		return fmt.Errorf("failed to enable notifications: %w", err)
 	}
@@ -212,6 +230,7 @@ func (c *LiTimeBluetoothClient) Connect(ctx context.Context) error {
 	c.address = address
 	c.device = device
 	c.writeCharacteristic = writeCharacteristic
+	c.notifyCharacteristic = &notifyCharacteristic
 	c.connected = true
 	c.mu.Unlock()
 
@@ -325,6 +344,13 @@ func (c *LiTimeBluetoothClient) discoverCharacteristics(device bluetooth.Device)
 
 // Disconnect drops the connection. The client can be reconnected afterwards with
 // Connect. Disconnecting an already-disconnected client is not an error.
+//
+// Notifications are turned off before the device is dropped. Disconnecting the
+// device alone does not end the subscription on Linux: the D-Bus signal match
+// and the goroutine delivering it stay alive, and because a reconnect reuses
+// the same characteristic path, each one left behind delivers every later
+// notification again. Without this, N reconnects meant N+1 copies of every
+// reading.
 func (c *LiTimeBluetoothClient) Disconnect() error {
 	c.mu.Lock()
 	if !c.connected {
@@ -332,16 +358,25 @@ func (c *LiTimeBluetoothClient) Disconnect() error {
 		return nil
 	}
 	device := c.device
+	notify := c.notifyCharacteristic
 	c.connected = false
-	c.device = bluetooth.Device{}
+	c.device = nil
 	c.writeCharacteristic = bluetooth.DeviceCharacteristic{}
+	c.notifyCharacteristic = nil
 	c.mu.Unlock()
 
-	if err := device.Disconnect(); err != nil {
-		return fmt.Errorf("failed to disconnect from device: %w", err)
+	var errs error
+	if notify != nil {
+		if err := notify.EnableNotifications(nil); err != nil {
+			errs = multierr.Append(errs, fmt.Errorf("failed to disable notifications: %w", err))
+		}
 	}
 
-	return nil
+	if err := device.Disconnect(); err != nil {
+		errs = multierr.Append(errs, fmt.Errorf("failed to disconnect from device: %w", err))
+	}
+
+	return errs
 }
 
 // QueryData asks the battery to report its current state. The reply arrives
